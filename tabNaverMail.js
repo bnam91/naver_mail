@@ -142,6 +142,10 @@ function sleep(ms) {
 }
 
 function pasteByPythonOsLevel(text) {
+  // Windows에서는 환경변수로 한글 전달 시 인코딩 깨짐 → 임시 파일로 전달
+  const bodyFile = path.join(os.tmpdir(), `naver_mail_body_${Date.now()}.txt`);
+  fs.writeFileSync(bodyFile, text, "utf8");
+
   const py = `
 import os
 import sys
@@ -149,27 +153,39 @@ import time
 import pyperclip
 import pyautogui
 
-body = os.environ.get("BODY_TEXT", "")
+body_file = os.environ.get("BODY_FILE", "")
+if not body_file or not os.path.isfile(body_file):
+    sys.exit(1)
+with open(body_file, encoding="utf-8") as f:
+    body = f.read()
+try:
+    os.remove(body_file)
+except Exception:
+    pass
+
 pyperclip.copy(body)
 time.sleep(0.05)
 
-ok = False
-for combo in (("command", "v"), ("ctrl", "v")):
-    try:
-        pyautogui.hotkey(*combo)
-        ok = True
-        break
-    except Exception:
-        pass
-
-if not ok:
+# hotkey()가 Windows에서 Ctrl 없이 'v'만 보내는 경우 있음 → keyDown/press/keyUp 사용
+mod = "command" if sys.platform == "darwin" else "ctrl"
+try:
+    pyautogui.keyDown(mod)
+    pyautogui.press("v")
+    pyautogui.keyUp(mod)
+except Exception as e:
     sys.exit(2)
 `;
 
-  const res = spawnSync("python3", ["-c", py], {
-    env: { ...process.env, BODY_TEXT: text },
+  // Windows는 보통 python, 맥/리눅스는 python3
+  const pythonCmd = process.platform === "win32" ? "python" : "python3";
+  const res = spawnSync(pythonCmd, ["-c", py], {
+    env: { ...process.env, BODY_FILE: bodyFile },
     encoding: "utf8",
   });
+
+  try {
+    if (fs.existsSync(bodyFile)) fs.unlinkSync(bodyFile);
+  } catch (_) {}
 
   if (res.status !== 0) {
     const msg = (res.stderr || res.stdout || "").trim() || `python exit code ${res.status}`;
@@ -302,7 +318,7 @@ async function sendEmail(data, options = {}) {
 
       const emailContent =
         emailContents[Math.floor(Math.random() * emailContents.length)].replace(/{이름}/g, name);
-      const bodyContent = emailContent;
+      const bodyContent = dev ? "테스트입니다1" : emailContent;
 
       await mailPage.waitForSelector(".editor_body iframe, .editor_body textarea", {
         timeout: 5000,

@@ -3,6 +3,15 @@
  * 실행: node index.js 또는 npm start
  */
 
+import { execSync } from "child_process";
+
+// Windows 콘솔 한글 깨짐 방지: 같은 콘솔에서 코드페이지를 UTF-8로 설정
+if (process.platform === "win32") {
+  try {
+    execSync("chcp 65001 >nul", { stdio: "inherit", shell: true });
+  } catch (_) {}
+}
+
 import { getDataFromSheets, sendEmail } from "./tabNaverMail.js";
 
 async function main() {
