@@ -5,7 +5,7 @@
 node_modules/
 
 # 로그/출력
-video_logs/
+*video_logs/
 
 # 개인 메모
 note
