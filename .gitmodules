@@ -1,0 +1,3 @@
+[submodule "submodules/module_chrome_set"]
+	path = submodules/module_chrome_set
+	url = https://github.com/bnam91/module_chrome_set

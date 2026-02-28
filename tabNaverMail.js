@@ -1,17 +1,23 @@
 /**
- * tab_naver_mail.py → Node.js (ESM)
- * 네이버 메일 자동 발송
+ * 네이버 메일 자동 발송 (Puppeteer + module_chrome_set)
+ * - 시트/DB 선택 → 프로필 선택(서브모듈) → 메일 발송
+ * - 로그인 없이 프로필 userData 사용
  */
 
-import { Builder, By, Key, until } from "selenium-webdriver";
-import chrome from "selenium-webdriver/chrome.js";
+import { createRequire } from "module";
+import fs from "fs";
 import os from "os";
 import path from "path";
 import { pathToFileURL } from "url";
-import clipboard from "clipboardy";
+import { spawnSync } from "child_process";
 import readlineSync from "readline-sync";
 import { google } from "googleapis";
 import { InstagramMessageTemplate } from "./naverMessageModule.js";
+
+const require = createRequire(import.meta.url);
+const { openBrowser } = require("./submodules/module_chrome_set/index.js");
+
+const USER_DATA_PATH = path.join(os.homedir(), "Documents", "github_cloud", "user_data");
 
 const AUTH_PATH = path.join(os.homedir(), "Documents", "github_cloud", "module_auth", "auth.js");
 const { getCredentials } = await import(pathToFileURL(AUTH_PATH).href);
@@ -23,7 +29,7 @@ function log(msg) {
 }
 
 /**
- * @returns {Promise<{emailTitles: string[], emailContents: string[], userId: string, userPw: string, recipientData: [string, string, number][], selectedDb: string}>}
+ * @returns {Promise<{emailTitles: string[], emailContents: string[], recipientData: [string, string, number][], selectedDb: string}>}
  */
 async function getDataFromSheets() {
   log("\n=== 메일 발송 준비를 시작합니다 ===");
@@ -79,30 +85,6 @@ async function getDataFromSheets() {
     log("올바른 번호를 입력해주세요.");
   }
 
-  const accountsRes = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: "아이디보드!A1:D",
-  });
-  const accounts = accountsRes.data.values || [];
-
-  log("\n=== 사용할 계정 번호를 선택하세요 ===");
-  accounts.slice(1).forEach((acc) => {
-    const note = acc[3] ? ` (${acc[3]})` : "";
-    log(`${acc[0]}. ${acc[1]}${note}`);
-  });
-
-  let userId, userPw;
-  while (true) {
-    const num = readlineSync.question("\n번호를 입력하세요: ");
-    const found = accounts.slice(1).find((acc) => String(acc[0]) === String(num));
-    if (found) {
-      userId = found[1];
-      userPw = found[2];
-      break;
-    }
-    log("올바른 번호를 입력해주세요.");
-  }
-
   const titleRes = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: `${selectedSheet}!B1:D1`,
@@ -140,31 +122,9 @@ async function getDataFromSheets() {
   return {
     emailTitles,
     emailContents,
-    userId,
-    userPw,
     recipientData,
     selectedDb,
   };
-}
-
-async function createDriver() {
-  const options = new chrome.Options();
-  options.excludeSwitches("enable-logging", "enable-automation");
-  options.addArguments(
-    "--log-level=3",
-    "--silent",
-    "--disable-gpu",
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu-sandbox",
-    "--disable-software-rasterizer",
-    "--disable-webgl",
-    "--disable-webgl2",
-    "--disable-logging",
-    "--disable-in-process-stack-traces"
-  );
-
-  return new Builder().forBrowser("chrome").setChromeOptions(options).build();
 }
 
 async function updateSheetStatus(sheets, spreadsheetId, sheetName, rowIndex, sentTime, status) {
@@ -181,106 +141,228 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function sendEmail(data) {
-  const { emailTitles, emailContents, userId, userPw, recipientData, selectedDb } = data;
+function pasteByPythonOsLevel(text) {
+  const py = `
+import os
+import sys
+import time
+import pyperclip
+import pyautogui
 
-  log("\n=== 메일 발송을 시작합니다 ===");
-  const driver = await createDriver();
+body = os.environ.get("BODY_TEXT", "")
+pyperclip.copy(body)
+time.sleep(0.05)
+
+ok = False
+for combo in (("command", "v"), ("ctrl", "v")):
+    try:
+        pyautogui.hotkey(*combo)
+        ok = True
+        break
+    except Exception:
+        pass
+
+if not ok:
+    sys.exit(2)
+`;
+
+  const res = spawnSync("python3", ["-c", py], {
+    env: { ...process.env, BODY_TEXT: text },
+    encoding: "utf8",
+  });
+
+  if (res.status !== 0) {
+    const msg = (res.stderr || res.stdout || "").trim() || `python exit code ${res.status}`;
+    throw new Error(msg);
+  }
+}
+
+async function getBodyPlainText(page) {
+  return page.evaluate(() => {
+    const ifr = document.querySelector(".editor_body iframe");
+    if (ifr?.contentDocument) {
+      const doc = ifr.contentDocument;
+      const body = doc.body;
+      const editable = doc.querySelector("[contenteditable='true'], [contenteditable]") || body;
+      const html = editable?.innerHTML || editable?.innerText || editable?.textContent || "";
+      return html.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "").trim();
+    }
+    const textarea = document.querySelector(".editor_body textarea");
+    return textarea?.value?.trim() || "";
+  });
+}
+
+/** naver_ 프로필 목록 조회 후 readlineSync로 선택 (서브모듈 readline 충돌 방지) */
+function selectNaverProfile() {
+  const profiles = [];
+  try {
+    const items = fs.readdirSync(path.join(USER_DATA_PATH));
+    for (const item of items) {
+      if (!item.startsWith("naver_")) continue;
+      const itemPath = path.join(USER_DATA_PATH, item);
+      const stat = fs.statSync(itemPath);
+      if (!stat.isDirectory()) continue;
+      const hasDefault = fs.existsSync(path.join(itemPath, "Default"));
+      const hasProfile = !hasDefault && fs.readdirSync(itemPath).some((s) => s.startsWith("Profile"));
+      if (hasDefault || hasProfile) profiles.push(item);
+    }
+  } catch (e) {
+    log(`프로필 목록 읽기 실패: ${e.message}`);
+    return null;
+  }
+  if (profiles.length === 0) {
+    log("사용 가능한 naver_ 프로필이 없습니다.");
+    return null;
+  }
+  log("\n=== 네이버 프로필을 선택하세요 ===");
+  profiles.forEach((p, i) => log(`${i + 1}. ${p}`));
+  while (true) {
+    const num = parseInt(readlineSync.question("\n번호를 입력하세요: "), 10) - 1;
+    if (!isNaN(num) && num >= 0 && num < profiles.length) return profiles[num];
+    log("올바른 번호를 입력해주세요.");
+  }
+}
+
+function stepWait(dev, msg, needEnter = false) {
+  if (!dev) return;
+  log(`  → ${msg}`);
+  if (needEnter) readlineSync.question("  [Enter]: ");
+}
+
+async function sendEmail(data, options = {}) {
+  const { emailTitles, emailContents, recipientData, selectedDb } = data;
+  const { dev = false } = options;
+
+  const profileName = selectNaverProfile();
+  if (!profileName) return;
+
+  const browser = await openBrowser({
+    profileName,
+    profilePath: USER_DATA_PATH,
+    url: "https://mail.naver.com/v2/new",
+    returnBrowser: true,
+  });
+
+  if (!browser) {
+    log("브라우저를 열 수 없습니다.");
+    return;
+  }
+
+  const pages = await browser.pages();
+  const mailPage = pages.find((p) => p.url().includes("mail.naver")) || pages[pages.length - 1];
+
   const creds = await getCredentials();
   const sheets = google.sheets({ version: "v4", auth: creds });
 
-  await driver.manage().window().maximize();
-  await driver.get("https://mail.naver.com/v2/new");
-
   try {
-    await driver.wait(until.elementLocated(By.css("#id")), 10000);
-    const idEl = await driver.findElement(By.css("#id"));
-    await clipboard.write(userId);
-    await idEl.sendKeys(Key.chord(Key.CONTROL, "v"));
-    await sleep(1000);
-
-    const pwEl = await driver.findElement(By.css("#pw"));
-    await clipboard.write(userPw);
-    await pwEl.sendKeys(Key.chord(Key.CONTROL, "v"));
-    await sleep(1000);
-
-    await driver.findElement(By.css(".btn_login")).click();
-    log("\n=== 로그인이 완료되었습니다 ===");
-
-    await driver.wait(until.elementLocated(By.css("#recipient_input_element")), 10000);
+    await mailPage.waitForSelector("#recipient_input_element", { timeout: 15000 });
+    stepWait(dev, "메일 쓰기 페이지 로드했어요. 받는사람 입력란 보이시나요? 제대로 됐으면 엔터 쳐주세요");
 
     const total = recipientData.length;
     for (let idx = 0; idx < total; idx++) {
       const [name, email, rowIdx] = recipientData[idx];
+      if (dev) log(`\n--- 메일 ${idx + 1}/${total}: ${name} <${email}> ---`);
 
       try {
-        const htmlBt = await driver.wait(
-          until.elementLocated(By.css("div.editor_mode_select button[value='HTML']")),
-          5000
-        );
-        await htmlBt.click();
-        await sleep(1000);
+        const htmlBt = await mailPage.$("div.editor_mode_select button[value='HTML']");
+        if (htmlBt) {
+          await htmlBt.click();
+          await sleep(1000);
+          stepWait(dev, "HTML 탭 클릭했어요. 제대로 됐는지 확인해주세요");
+        } else {
+          stepWait(dev, "HTML 탭 없어서 건너뜀. 확인했으면 엔터 쳐주세요");
+        }
       } catch {
-        // HTML 버튼 없으면 무시
+        stepWait(dev, "HTML 탭 클릭 실패해서 건너뜀. 확인했으면 엔터 쳐주세요");
       }
 
-      const addrEl = await driver.findElement(By.css("#recipient_input_element"));
-      await addrEl.clear();
-      await clipboard.write(email);
-      await addrEl.sendKeys(Key.chord(Key.CONTROL, "v"));
-      await addrEl.sendKeys(Key.ENTER);
+      const addrEl = await mailPage.$("#recipient_input_element");
+      await addrEl.click();
+      await addrEl.evaluate((el, value) => {
+        el.value = value;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }, email);
+      await mailPage.keyboard.press("Enter");
       await sleep(1000);
+      stepWait(dev, "받는사람 입력했어요. 제대로 됐는지 확인해주세요");
 
-      const titleEl = await driver.findElement(By.css("#subject_title"));
-      await titleEl.clear();
       const emailTitle =
         emailTitles[Math.floor(Math.random() * emailTitles.length)].replace(/{이름}/g, name);
-      await clipboard.write(emailTitle);
-      await titleEl.sendKeys(Key.chord(Key.CONTROL, "v"));
-      await titleEl.sendKeys(Key.TAB);
-      await sleep(500);
+      const titleEl = await mailPage.$("#subject_title");
+      await titleEl.click();
+      await titleEl.evaluate((el, value) => {
+        el.value = value;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }, emailTitle);
+      await mailPage.keyboard.press("Tab");
+      await sleep(800);
+      stepWait(dev, "제목 입력했어요. 제대로 됐는지 확인해주세요");
 
       const emailContent =
         emailContents[Math.floor(Math.random() * emailContents.length)].replace(/{이름}/g, name);
-      await clipboard.write(emailContent);
-      const actions = driver.actions({ async: true });
-      await actions.keyDown(Key.CONTROL).sendKeys("a").keyUp(Key.CONTROL).perform();
-      await actions.keyDown(Key.CONTROL).sendKeys("v").keyUp(Key.CONTROL).perform();
-      await sleep(2000);
+      const bodyContent = emailContent;
 
-      const sendBtn = await driver.findElement(By.css(".button_write_task"));
+      await mailPage.waitForSelector(".editor_body iframe, .editor_body textarea", {
+        timeout: 5000,
+      }).catch(() => null);
+      await sleep(300);
+
+      const methodBodyContent = bodyContent;
+      let bodyInserted = false;
+      try {
+        pasteByPythonOsLevel(methodBodyContent);
+        await sleep(500);
+        const pasted = await getBodyPlainText(mailPage);
+        const probe = methodBodyContent.replace(/\s+/g, " ").slice(0, 8);
+        bodyInserted = pasted.replace(/\s+/g, " ").includes(probe);
+        if (!bodyInserted) throw new Error("python 붙여넣기 후 본문 반영 확인 실패");
+        if (dev) log("  [본문] 방법 1 성공: 1) [레거시] Tab 후 평문 클립보드 + Ctrl+V");
+      } catch (e) {
+        if (dev) log("  [본문] 방법 1 실패: 1) [레거시] Tab 후 평문 클립보드 + Ctrl+V");
+      }
+
+      if (!bodyInserted) log("  [경고] 본문 입력 실패");
+      await sleep(2000);
+      stepWait(dev, "본문 입력했어요. 제대로 됐는지 확인해주세요");
+
+      // stepWait(dev, "보내기 직전입니다. 확인 후 엔터를 눌러주세요", true);
+
+      const sendBtn = await mailPage.$(".button_write_task");
       await sendBtn.click();
       await sleep(5000);
+      stepWait(dev, "보내기 버튼 클릭했어요. 제대로 됐는지 확인해주세요");
 
-      await driver.get("https://mail.naver.com/v2/folders/2");
+      await mailPage.goto("https://mail.naver.com/v2/folders/2");
       await sleep(5000);
+      stepWait(dev, "보낸편지함으로 이동했어요. 제대로 됐는지 확인해주세요");
 
       try {
-        const mailItems = await driver.wait(
-          until.elementsLocated(By.css("li.mail_item.reception")),
-          10000
-        );
+        const mailItems = await mailPage.$$("li.mail_item.reception");
         if (mailItems.length > 0) {
           const latest = mailItems[0];
-          const recipientEl = await latest.findElement(By.css(".recipient_link"));
-          const recipientText = await recipientEl.getText();
-          const recipient = recipientText.split("\n").pop().trim();
-          const statusEl = await latest.findElement(By.css(".sent_status"));
-          const timeEl = await latest.findElement(By.css(".sent_time"));
-          let status = await statusEl.getText();
-          let sentTime = await timeEl.getText();
+          const recipientEl = await latest.$(".recipient_link");
+          const recipientText = await recipientEl.evaluate((el) => el.textContent);
+          const recipientRaw = recipientText.split("\n").pop().trim();
+          const recipientMatch = recipientRaw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+          const recipient = recipientMatch ? recipientMatch[0] : recipientRaw;
+          const statusEl = await latest.$(".sent_status");
+          const timeEl = await latest.$(".sent_time");
+          let status = await statusEl.evaluate((el) => el.textContent);
+          let sentTime = await timeEl.evaluate((el) => el.textContent);
 
           const now = new Date();
           const dateStr = `${String(now.getFullYear()).slice(-2)}년 ${now.getMonth() + 1}월 ${now.getDate()}일`;
           sentTime = `${dateStr} ${sentTime}`;
 
           log("\n=== 메일 발송 상태 ===");
-          log(`받는사람: ${recipient}`);
+          log(`받는사람: ${recipientRaw}`);
           log(`상태: ${status}`);
           log(`발송시각: ${sentTime}`);
 
-          if (recipient.trim().toLowerCase() !== email.trim().toLowerCase()) {
-            log(`이메일 주소 불일치! 예상: ${email}, 실제: ${recipient}`);
+          if (recipient.toLowerCase() !== email.trim().toLowerCase()) {
+            log(`이메일 주소 불일치! 예상: ${email}, 실제: ${recipientRaw}`);
             status = "미발송 (이메일 불일치)";
             sentTime = "-";
           }
@@ -291,30 +373,37 @@ async function sendEmail(data) {
         log(`상태 확인 실패: ${e.message}`);
         await updateSheetStatus(sheets, SPREADSHEET_ID, selectedDb, rowIdx, "-", "미발송 (확인실패)");
       }
+      stepWait(dev, "발송 상태 확인했어요. 제대로 됐는지 확인해주세요");
 
       log(`\n=== 진행상황: ${idx + 1}/${total} 완료 ===`);
+      stepWait(dev, "다음 메일 준비했어요. 제대로 됐는지 확인해주세요");
 
       if (idx < total - 1) {
-        const waitTime = Math.floor(Math.random() * (70 - 3 + 1)) + 3;
-        log("\n다음 메일 발송까지 대기...");
+        const waitTime = dev ? 2 : Math.floor(Math.random() * (70 - 3 + 1)) + 3;
+        log(dev ? "\n[디버그] 2초 대기 후 다음 메일..." : "\n다음 메일 발송까지 대기...");
         for (let r = waitTime; r > 0; r--) {
           process.stdout.write(`\r${r}초 남음...`);
           await sleep(1000);
         }
         process.stdout.write("\r대기 완료!            \n");
 
-        await driver.get("https://mail.naver.com/v2/new");
-        await driver.wait(until.elementLocated(By.css("#recipient_input_element")), 10000);
+        await mailPage.goto("https://mail.naver.com/v2/new");
+        await mailPage.waitForSelector("#recipient_input_element", { timeout: 10000 });
         await sleep(2000);
+        stepWait(dev, "새 메일 쓰기 페이지로 이동했어요. 제대로 됐는지 확인해주세요");
       }
     }
   } catch (e) {
     log(`\n=== 오류가 발생했습니다: ${e.message} ===`);
   } finally {
     log("\n=== 메일 발송이 완료되었습니다 ===");
-    log("Enter 키를 눌러 브라우저를 종료하세요...");
-    readlineSync.question("");
-    await driver.quit();
+    if (dev) {
+      log("[dev] 브라우저를 열어둡니다.");
+    } else {
+      log("Enter 키를 눌러 브라우저를 종료하세요...");
+      readlineSync.question("");
+      await browser.close();
+    }
   }
 }
 
