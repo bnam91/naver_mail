@@ -1,0 +1,20 @@
+{
+  "name": "naver-mail",
+  "version": "1.0.0",
+  "description": "네이버 메일 자동 발송 (Node.js)",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "mail": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "clipboardy": "^4.0.0",
+    "googleapis": "^140.0.0",
+    "readline-sync": "^1.4.10",
+    "selenium-webdriver": "^4.26.0"
+  }
+}

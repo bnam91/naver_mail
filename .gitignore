@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Node.js
+node_modules/
+
+# 로그/출력
+video_logs/
+
+# 개인 메모
+note
